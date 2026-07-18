@@ -1,0 +1,25 @@
+# Clash / Shadowrocket balanced DNS base
+# 加密 DNS + 国内外回退；配合 GEOIP,CN（不使用 no-resolve）
+
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: false
+
+dns:
+  enable: true
+  ipv6: false
+  listen: 0.0.0.0:1053
+  enhanced-mode: redir-host
+  nameserver:
+    - https://1.12.12.12/dns-query
+    - https://120.53.53.53/dns-query
+  fallback:
+    - https://1.0.0.1/dns-query
+    - tls://8.8.4.4:853
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+    ipcidr:
+      - 240.0.0.0/4
