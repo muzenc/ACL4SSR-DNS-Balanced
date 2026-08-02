@@ -1,5 +1,16 @@
-# Clash subscription base for Shadowrocket strict DNS privacy
-# 业务域名全部使用经代理转发的境外 DoH；国内 DNS 仅解析代理节点域名
+# 严格 DNS 基础配置（Shadowrocket + Mihomo/Clash Verge 通用）
+#
+# 核心思路：让「需要本地解析的域名」和「不该被国内 DNS 看到的域名」完全不重叠。
+#
+#   走直连的国内域名 —— 必须本地解析才能连 —— 用国内 DoH，快
+#   走代理的境外域名 —— 域名直接交给代理，节点远端解析 —— 本地 DNS 完全不参与
+#
+# 这依赖配套 .ini 中 GEOIP,CN 带 no-resolve：未命中国内域名规则的连接不再触发
+# 本地解析，直接交给代理。去掉 no-resolve 会让境外域名也被下面的国内 DoH 解析，
+# 泄露检测立刻会看到中国解析器。
+#
+# Shadowrocket 的原生语义与此一致：「DNS 覆写仅针对直连类域名进行解析，
+# 代理类域名将经由代理服务器进行解析」。
 
 mixed-port: 7890
 allow-lan: false
@@ -7,14 +18,33 @@ mode: rule
 log-level: info
 ipv6: false
 
+geo-auto-update: true
+geo-update-interval: 24
+
 dns:
   enable: true
   ipv6: false
-  listen: 0.0.0.0:1053
+  listen: 127.0.0.1:1053
+  # 必须是 redir-host。fake-ip 下拿到的是 198.18.x.x 假 IP，
+  # 直连域名无法得到真实地址。
   enhanced-mode: redir-host
-  nameserver:
-    - "https://dns.google/dns-query#proxy"
-  fallback:
-    - "https://cloudflare-dns.com/dns-query#proxy"
+
+  # 仅用于解析域名形式的 DNS 服务器；本文件全部是 IP 形式，不会被触发
+  default-nameserver:
+    - 223.5.5.5
+    - 119.29.29.29
+
+  # 解析代理节点自身的域名。节点是 IP 时不触发
   proxy-server-nameserver:
+    - https://223.5.5.5/dns-query
+    - https://1.12.12.12/dns-query
+
+  # 只有走直连的域名会用到这里——也就是规则集判定为国内的那些。
+  # 用国内加密 DoH：实测 www.meituan.com 从 2089ms 降到 145ms，
+  # 且解析到北京联通本地节点，CDN 选点最准。
+  #
+  # 境外域名不会经过这里：它们被判走代理后，域名直接交给节点远端解析，
+  # 本地不产生任何 DNS 查询。实测泄露检测显示 10/10 美国 Google 解析器。
+  nameserver:
+    - https://223.5.5.5/dns-query
     - https://1.12.12.12/dns-query
