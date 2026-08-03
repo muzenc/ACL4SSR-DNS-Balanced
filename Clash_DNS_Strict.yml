@@ -1,16 +1,21 @@
 # 严格 DNS 基础配置（Shadowrocket + Mihomo/Clash Verge 通用）
 #
-# 核心思路：让「需要本地解析的域名」和「不该被国内 DNS 看到的域名」完全不重叠。
+# 设计目标：不依赖规则集覆盖，未知域名也能被正确判定，且不出现任何国内 DNS。
 #
-#   走直连的国内域名 —— 必须本地解析才能连 —— 用国内 DoH，快
-#   走代理的境外域名 —— 域名直接交给代理，节点远端解析 —— 本地 DNS 完全不参与
+# 做法：全部域名由境外 DoH 经代理解析，解析结果交给 GEOIP,CN 判定走直连还是走代理。
+# 规则集只负责"已知的例外"，未收录的域名靠 IP 兜底——因此不存在"规则集覆盖不全"的问题。
 #
-# 这依赖配套 .ini 中 GEOIP,CN 带 no-resolve：未命中国内域名规则的连接不再触发
-# 本地解析，直接交给代理。去掉 no-resolve 会让境外域名也被下面的国内 DoH 解析，
-# 泄露检测立刻会看到中国解析器。
+# 关键是必须带 ECS。不带 ECS 时国内 CDN 按"提问者在境外"分配节点，会把你导向
+# 海外边缘节点：实测 www.bilibili.com 解析到 192.254.90.178（美国洛杉矶）、
+# i0.hdslb.com 到 138.113.102.14（加拿大多伦多）。而 bilibili.com 命中域名规则
+# 被判 DIRECT，于是变成从国内直连一台美国服务器，又慢又容易被掐。
+# 带上华北联通 ECS 后同样的域名解析到 218.60.18.14（辽宁联通），恢复正常。
 #
-# Shadowrocket 的原生语义与此一致：「DNS 覆写仅针对直连类域名进行解析，
-# 代理类域名将经由代理服务器进行解析」。
+# 关于 #proxy：
+#   Shadowrocket —— 原生的 DNS-over-proxy 关键字
+#   Mihomo       —— 把 # 后的名称当作策略组名查找，配套 .ini 中定义了名为 proxy 的组
+# 若 .ini 里的 proxy 组被删除或改名，Mihomo 会把 proxy 当网卡名去绑，绑不上，
+# 本地 DNS 全部失效——表现为境外网站正常、国内直连站点全部打不开。
 
 mixed-port: 7890
 allow-lan: false
@@ -25,26 +30,32 @@ dns:
   enable: true
   ipv6: false
   listen: 127.0.0.1:1053
-  # 必须是 redir-host。fake-ip 下拿到的是 198.18.x.x 假 IP，
-  # 直连域名无法得到真实地址。
+  # 必须是 redir-host。fake-ip 下 GEOIP,CN 拿到的是 198.18.x.x 假 IP，
+  # 整个按 IP 判定的设计会失效。
   enhanced-mode: redir-host
 
-  # 仅用于解析域名形式的 DNS 服务器；本文件全部是 IP 形式，不会被触发
+  # 以下两项正常情况下不会被触发，刻意填境外地址：
+  # 一旦被触发应当解析失败，而不是退回国内 DNS。
+  # 若节点改用域名形式，代理会起不来（而非静默泄露），此时用 hosts 钉死节点 IP。
   default-nameserver:
-    - 223.5.5.5
-    - 119.29.29.29
-
-  # 解析代理节点自身的域名。节点是 IP 时不触发
+    - 1.1.1.1
+    - 8.8.8.8
   proxy-server-nameserver:
-    - https://223.5.5.5/dns-query
-    - https://1.12.12.12/dns-query
+    - 1.1.1.1
+    - 8.8.8.8
 
-  # 只有走直连的域名会用到这里——也就是规则集判定为国内的那些。
-  # 用国内加密 DoH：实测 www.meituan.com 从 2089ms 降到 145ms，
-  # 且解析到北京联通本地节点，CDN 选点最准。
+  # 全部业务域名：境外 DoH，经代理发出，附带华北联通 ECS。
   #
-  # 境外域名不会经过这里：它们被判走代理后，域名直接交给节点远端解析，
-  # 本地不产生任何 DNS 查询。实测泄露检测显示 10/10 美国 Google 解析器。
+  # 只用 Google：Cloudflare 按其隐私政策不转发 ECS，混进来会出现"谁先应答用谁"
+  # 的抖动，一旦用了 Cloudflare 的结果，国内站点就会拿到海外节点。
+  #
+  # ↓ 换成你所在地运营商的网段，CDN 选点会更贴近：
+  #     联通北京 202.106.0.0/24（当前）  电信上海 202.96.209.0/24
+  #     电信广东 202.96.128.0/24         移动     211.136.192.0/24
   nameserver:
-    - https://223.5.5.5/dns-query
-    - https://1.12.12.12/dns-query
+    - "https://8.8.8.8/dns-query#proxy&ecs=202.106.0.0/24&ecs-override=true"
+    - "https://8.8.4.4/dns-query#proxy&ecs=202.106.0.0/24&ecs-override=true"
+
+# 少数站点的权威服务器不认 ECS（www.baidu.com）或使用全球 CDN（ctrip.com、
+# qunar.com），仍会解析到境外 IP，GEOIP,CN 会判错。它们由 ChinaDomain.list
+# 按域名兜住，该规则集位置在 GEOIP,CN 之前。
