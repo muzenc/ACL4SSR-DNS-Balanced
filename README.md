@@ -70,15 +70,28 @@
 
 ## 严格版的 DNS 结构
 
-**不依赖规则集覆盖**。全部域名由境外 DoH 经代理解析，解析结果交给 `GEOIP,CN` 判定走直连还是走代理；规则集只负责已知的例外。规则集再大也不可能覆盖所有网站，所以兜底必须由 IP 来做。
+**不依赖规则集覆盖，且境内外各用各的解析视角。** 全部解析器都在境外（零国内 DNS），靠三层结构决定每个域名用哪个「视角」的答案：
 
-| 域名 | 解析器 | 判定 |
-| --- | --- | --- |
-| 命中国内域名规则 | 境外 DoH + 中国 ECS，经代理 | `DIRECT` |
-| `geosite:geolocation-!cn` 命中 | 境外 DoH，无 ECS，经代理 | 按规则或 `FINAL` 走代理 |
-| 其余全部（未知） | 境外 DoH + 中国 ECS，经代理 | 解析出国内 IP 则 `GEOIP,CN` 直连，否则代理 |
+| 层 | 命中范围 | 解析器 | 目的 |
+| --- | --- | --- | --- |
+| `nameserver-policy` `geosite:cn` | 已知国内域名 | Google DoH + 中国 ECS，经代理 | 钉死 ECS 分支，bilibili 永不被换成美国答案 |
+| `nameserver-policy` `geosite:geolocation-!cn` | 已知境外域名 | 1.1.1.1，无 ECS，经代理 | 钉死干净分支，github 不会拿到新加坡节点 |
+| `nameserver`(ECS) + `fallback`(无 ECS) + `fallback-filter` | **其余未知域名** | 两支并发，按结果国别自动分拣 | 未收录域名不需要任何人工维护 |
 
-实测 `frp-arm.com`（西安联通，不在任何规则集里）命中 `GeoIP(cn)` 正确直连。
+第三层是关键，用的是经典 Clash 防污染机制的**反向用法**——不是拿它防投毒，而是拿它挑选 ECS 视角。mihomo 官方文档对 `fallback-filter.geoip` 的原文：「geoip-code 配置的国家的结果会直接采用，否则将采用 fallback 结果」。于是：
+
+- 未知域名的 ECS 答案是国内 IP（`frp-arm.com` → 西安联通）→ 采信 → `GEOIP,CN` 直连；
+- 未知域名的 ECS 答案是境外 IP（`macked.app` → Cloudflare）→ 换用 1.1.1.1 的无 ECS 答案 → 走代理，按美国出口视角落点。
+
+`fallback` 是**并发**查询而非失败后备（`fallback-lazy-query` 默认 false），所以这个分拣不增加延迟。
+
+### 为什么已知域名要用 policy 钉死，不能全交给 filter
+
+实测（mihomo v1.19.25）：**policy 命中的域名跳过 fallback-filter**——官方文档「优先于 nameserver/fallback 查询」，探针实验证实。这个特性被反过来利用：
+
+Google 对 bilibili 权威的 ECS 应答有约 25% 概率（8 次采样 2 次）返回其**香港段** `103.151.151.x`。若交给 filter，非 CN 答案会被换成 1.1.1.1 的美国 Zenlayer 答案，而 `bilibili.com` 命中域名规则走 `DIRECT`——变成从国内直连美国服务器，就是此前 bilibili 打不开的机制。用 policy 钉死 ECS 分支后，最坏情况是偶尔拿到 bilibili 自家香港边缘，仍然可用。
+
+`nameserver-policy` 仅 mihomo 识别。Shadowrocket 忽略它后**恰好退化为纯三字段方案**（`nameserver`/`fallback`/`fallback-filter` 都是老 Clash 字段）；且已知境外域名在 Shadowrocket 上属于代理类，「代理类域名将经由代理服务器进行解析」（官方手册），本地 DNS 根本不参与，policy 缺失不影响它们的落点。
 
 ### 为什么必须带 ECS
 
@@ -87,25 +100,22 @@
 | 域名 | 无 ECS 解析到 | 带华北联通 ECS |
 | --- | --- | --- |
 | `www.bilibili.com` | `192.254.90.178` 美国洛杉矶 | `221.204.56.86` 太原 |
-| `i0.hdslb.com` | `138.113.102.14` 加拿大多伦多 | `218.11.15.31` 承德 |
+| `i0.hdslb.com` | `138.113.102.14` 加拿大多伦多 | `218.11.15.28` 承德 |
 
-而 `bilibili.com` 命中域名规则被判 `DIRECT`，于是变成**从国内直连一台美国服务器**：不走代理所以没有隧道加速，纯国际直连又慢又容易被掐，那些节点回的还是国际版内容。
+而 `bilibili.com` 命中域名规则被判 `DIRECT`，于是变成**从国内直连一台美国服务器**。这个故障非常隐蔽——规则层日志显示 `📺 B站[DIRECT]` 完全正确，问题全在解析结果上，必须把解析到的 IP 拉出来验归属才能发现。
 
-这个故障非常隐蔽——**规则层看起来完全正确**，日志里明明白白写着 `📺 B站[DIRECT]`。问题全在解析结果上，只看路由日志永远查不出来，必须把解析到的 IP 拉出来验归属。
+ECS 相关的工程细节：
 
-### 为什么境外域名不带 ECS
+- 网段粒度用 /24——比这更细会被上游拒绝（明文 REFUSED）；
+- ECS 分支只用 Google（8.8.8.8 / 8.8.4.4，同一 anycast 服务）；干净分支只用 1.1.1.1——Cloudflare 按其隐私政策**永不转发 ECS**，这是「无 ECS」保证的来源，两支不可混用；
+- `#proxy&ecs=...&ecs-override=true` 的多参数语法在 mihomo 官方文档和 Shadowrocket 社区手册中同形记载（`&` 串联）；
+- 换成你所在地运营商的网段更优：联通北京 `202.106.0.0/24`（当前）、电信上海 `202.96.209.0/24`、电信广东 `202.96.128.0/24`、移动 `211.136.192.0/24`。
 
-带上中国 ECS 会让境外站点返回亚太边缘节点，而你是从代理出口访问的，等于绕远。实测 `github.com` 带 ECS 解析到新加坡 `20.205.243.166`，不带则是美国 `20.29.134.23`——节点在洛杉矶，后者明显更优。顺带也不必告诉境外站点你在中国。
+### 代价与边界
 
-未被 `geosite` 收录的域名仍走带 ECS 的默认解析器，这是有意的：未知域名更可能是国内站点，带 ECS 才能拿到正确的国内 IP 供 `GEOIP,CN` 判定。
-
-`nameserver-policy` 仅 Mihomo 识别，Shadowrocket 会忽略，其行为退化为全部带 ECS——仍然可用，只是境外站点的选点不够优。
-
-### 代价：DNS 延迟
-
-所有未缓存域名的解析都要经代理往返。实测经节点查境外 DoH 平均 1341ms，直连国内 DoH 平均 310ms。命中缓存后为 16–17ms，因此影响集中在每个域名的首次访问。
-
-这是「不依赖规则集」必须付的账：要让未知域名被正确判定，就必须先解析它；要不泄露，解析就必须走境外。
+- 所有未缓存域名的解析都经代理往返（实测首次 278–843ms，缓存后 16–17ms），影响集中在每个域名的首次访问；
+- 少数国内站点权威不认 ECS（`www.baidu.com`）或用全球 CDN（`ctrip.com`），仍解析到境外 IP，由 `ChinaDomain.list` 按域名兜住（位置在 `GEOIP,CN` 之前）；
+- 在中国部署了 CDN 的境外站点（如部分 Apple/Microsoft 域名）ECS 答案可能是国内 IP，会被判直连——这与主流规则集的处理方向一致，是期望行为。
 
 ## 隐私边界
 
@@ -131,11 +141,14 @@
 
 | 项目 | 结果 |
 | --- | --- |
-| 泄露检测解析器 | 12/12 美国 Google，零中国解析器 |
-| `frp-arm.com`（规则集未收录） | `GeoIP(cn)` → `DIRECT`，解析到西安联通 |
-| `www.bilibili.com` | `DIRECT`，解析到 `221.204.56.86` 太原 |
-| `github.com` | 走代理，解析到美国而非亚太（无 ECS 支生效） |
-| DNS 解析耗时 | 首次 278–843ms，命中缓存 16–17ms |
+| 泄露检测解析器 | 全部美国 Google/Cloudflare，零中国解析器 |
+| `frp-arm.com`（规则集未收录） | ECS 答案西安联通 → `GeoIP(cn)` → `DIRECT` |
+| `www.bilibili.com` | policy 钉 ECS → 太原联通，`DIRECT` |
+| `github.com` / `www.amazon.com` | policy 钉无 ECS → 美国 Quincy / 洛杉矶 |
+| `macked.app`（未知境外） | filter 换用干净答案 → 走代理 |
+| Cloudflare 边缘核验 | `colo=LAS`（美国），非亚太 |
+
+Shadowrocket 侧一项无法在本机验证：它对 Clash `fallback` / `fallback-filter` 字段的支持程度。导入后请在 DNS 设置里确认这两组服务器都存在、`#proxy` 与 `ecs=` 参数未丢失；若 filter 不生效，退化行为是未知境外域名偶尔拿到亚太节点（经代理仍可用），已知域名不受影响。
 
 ## 陌生国内域名怎么处理
 
