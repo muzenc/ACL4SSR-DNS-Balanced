@@ -142,6 +142,24 @@ hosts:
 
 > 如果导入后 `#proxy` 消失，说明当前 Shadowrocket 版本或转换链路没有完整保留该 Clash DNS 字段，此时不要把测试结果视为严格模式已生效。
 
+## 陌生国内域名怎么处理
+
+`GEOIP,CN` 带了 `no-resolve`，好处是境外域名完全不碰本地 DNS，代价是**没被规则集收录的国内域名不再靠 IP 兜底判直连**，会走代理。
+
+因此严格版额外引入了 `ChinaMax.list`（12.4 万条），把这个缺口压到最小。实测 `frp-arm.com`（西安联通，不在 ACL4SSR 的 `ChinaDomain.list` 里）由此正确直连。
+
+代价是订阅体积：440KB / 9,713 条 → 5.6MB / 134,193 条。如果 Shadowrocket 导入变慢或不稳，删掉 `ChinaMax.list` 那一行即可退回小规则集，再按需逐条补：
+
+```ini
+ruleset=🎯 国内,[]DOMAIN-SUFFIX,example.cn
+```
+
+### 为什么要把泄露检测站强制走代理
+
+`browserleaks.com` 被 `ChinaMax` 收录（该表的定义是"国内可直连"，不是"中国站点"）。若判直连，它的域名会由国内 DoH 解析，检测结果就会显示中国解析器——但那测的是直连链路，不是你要验证的代理链路。
+
+所以 `.ini` 里有三条排在国内规则集之前的覆盖规则，把 `browserleaks.com` / `dnsleaktest.com` / `ipleak.net` 强制归入代理组。删掉它们，检测结果会失真。
+
 ## 上游规则
 
 规则主要来自 [ACL4SSR](https://github.com/ACL4SSR/ACL4SSR) 和 [zsokami/ACL4SSR](https://github.com/zsokami/ACL4SSR)。
