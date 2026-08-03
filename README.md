@@ -5,7 +5,7 @@
 目标是在以下需求之间取得平衡：
 
 - 国内域名和中国 IP 尽量直连；
-- 未收录域名先解析再用 `GEOIP,CN` 按 IP 判断，不依赖规则集覆盖；
+- 平衡版：未收录域名允许解析 IP，再用 `GEOIP,CN` 判断；严格版用 `no-resolve` 关闭该行为；
 - 国外和未知流量默认走代理；
 - DNS 全部使用 DoH，避免传统 UDP 53 明文查询；
 - 不生成美国、日本等国家分组；
@@ -15,8 +15,9 @@
 
 - `ACL4SSR_DNS_Balanced.ini`：ACL4SSR/subconverter 外部配置，控制规则顺序和代理分组。
 - `Clash_DNS_Balanced.yml`：Clash 基础配置，启用加密 DNS、国内解析和国外回退。
-- `ACL4SSR_DNS_Strict.ini`：为 Shadowrocket 生成 Clash 订阅的严格 DNS 外部配置。
-- `Clash_DNS_Strict.yml`：全部域名由境外 DoH 经代理解析（国内域名附带中国 ECS），再按 IP 判定走向。
+- `ACL4SSR_DNS_Strict.ini`：严格版（**Shadowrocket 用这份**）。只有直连域名走本地（国内 DoH）解析，代理域名交由节点远端解析。
+- `Clash_DNS_Strict.yml`：严格版的 Clash 基础配置。
+- `ACL4SSR_DNS_Strict_Mihomo.ini` / `Clash_DNS_Strict_Mihomo.yml`：Clash Verge 专用增强版，零国内 DNS + 未知域名按 IP 判定，依赖 Shadowrocket 没有的字段与行为。
 
 ## 远程配置地址
 
@@ -64,58 +65,48 @@
 4. 解析到中国 IP 时，`GEOIP,CN` 使其直连。
 5. 解析到非中国 IP 时，由 `FINAL` 兜底走代理。
 
-两版都使用 `GEOIP,CN` 且不带 `no-resolve`，这是 ToDesk、`frp-arm.com` 等未收录国内域名仍能靠 IP 直连的关键。
+**平衡版**使用 `GEOIP,CN` 且不带 `no-resolve`，这是 ToDesk 等未收录国内域名仍能靠 IP 判断直连的关键。
 
-区别在**谁来做第 3 步的解析**：平衡版用国内 DoH（快，但国内 DNS 看得到你的查询），严格版用经代理的境外 DoH（不泄露，但慢）。详见下面「严格版的 DNS 结构」。
+**严格版**给 `GEOIP,CN` 加了 `no-resolve`，因此第 3–5 步不适用于它——未命中域名规则的连接不再触发本地解析，直接交给代理。详见下面「严格版的 DNS 结构」。
 
 ## 严格版的 DNS 结构
 
-**不依赖规则集覆盖，且境内外各用各的解析视角。** 全部解析器都在境外（零国内 DNS），靠三层结构决定每个域名用哪个「视角」的答案：
+核心思路：让**需要本地解析的域名**和**不该被国内 DNS 看到的域名**完全不重叠。
 
-| 层 | 命中范围 | 解析器 | 目的 |
-| --- | --- | --- | --- |
-| `nameserver-policy` `geosite:cn` | 已知国内域名 | Google DoH + 中国 ECS，经代理 | 钉死 ECS 分支，bilibili 永不被换成美国答案 |
-| `nameserver-policy` `geosite:geolocation-!cn` | 已知境外域名 | 1.1.1.1，无 ECS，经代理 | 钉死干净分支，github 不会拿到新加坡节点 |
-| `nameserver`(ECS) + `fallback`(无 ECS) + `fallback-filter` | **其余未知域名** | 两支并发，按结果国别自动分拣 | 未收录域名不需要任何人工维护 |
-
-第三层是关键，用的是经典 Clash 防污染机制的**反向用法**——不是拿它防投毒，而是拿它挑选 ECS 视角。mihomo 官方文档对 `fallback-filter.geoip` 的原文：「geoip-code 配置的国家的结果会直接采用，否则将采用 fallback 结果」。于是：
-
-- 未知域名的 ECS 答案是国内 IP（`frp-arm.com` → 西安联通）→ 采信 → `GEOIP,CN` 直连；
-- 未知域名的 ECS 答案是境外 IP（`macked.app` → Cloudflare）→ 换用 1.1.1.1 的无 ECS 答案 → 走代理，按美国出口视角落点。
-
-`fallback` 是**并发**查询而非失败后备（`fallback-lazy-query` 默认 false），所以这个分拣不增加延迟。
-
-### 为什么已知域名要用 policy 钉死，不能全交给 filter
-
-实测（mihomo v1.19.25）：**policy 命中的域名跳过 fallback-filter**——官方文档「优先于 nameserver/fallback 查询」，探针实验证实。这个特性被反过来利用：
-
-Google 对 bilibili 权威的 ECS 应答有约 25% 概率（8 次采样 2 次）返回其**香港段** `103.151.151.x`。若交给 filter，非 CN 答案会被换成 1.1.1.1 的美国 Zenlayer 答案，而 `bilibili.com` 命中域名规则走 `DIRECT`——变成从国内直连美国服务器，就是此前 bilibili 打不开的机制。用 policy 钉死 ECS 分支后，最坏情况是偶尔拿到 bilibili 自家香港边缘，仍然可用。
-
-`nameserver-policy` 仅 mihomo 识别。Shadowrocket 忽略它后**恰好退化为纯三字段方案**（`nameserver`/`fallback`/`fallback-filter` 都是老 Clash 字段）；且已知境外域名在 Shadowrocket 上属于代理类，「代理类域名将经由代理服务器进行解析」（官方手册），本地 DNS 根本不参与，policy 缺失不影响它们的落点。
-
-### 为什么必须带 ECS
-
-不带 ECS 时国内 CDN 按「提问者在境外」分配节点，会把你导向海外边缘节点：
-
-| 域名 | 无 ECS 解析到 | 带华北联通 ECS |
+| 域名类型 | 路由 | 谁来解析 |
 | --- | --- | --- |
-| `www.bilibili.com` | `192.254.90.178` 美国洛杉矶 | `221.204.56.86` 太原 |
-| `i0.hdslb.com` | `138.113.102.14` 加拿大多伦多 | `218.11.15.28` 承德 |
+| 命中国内规则集 | `DIRECT` | 本地国内 DoH（`223.5.5.5` / `1.12.12.12`），快 |
+| 其余全部 | 代理 | 域名直接交给节点，**远端解析**，本地不产生任何 DNS 查询 |
 
-而 `bilibili.com` 命中域名规则被判 `DIRECT`，于是变成**从国内直连一台美国服务器**。这个故障非常隐蔽——规则层日志显示 `📺 B站[DIRECT]` 完全正确，问题全在解析结果上，必须把解析到的 IP 拉出来验归属才能发现。
+这依赖 `.ini` 中 `GEOIP,CN` 带 `no-resolve`：未命中国内域名规则的连接不再触发本地解析。**去掉 `no-resolve`，境外域名会被上面的国内 DoH 解析，泄露检测立刻会看到中国解析器。**
 
-ECS 相关的工程细节：
+Shadowrocket 的原生语义与此完全一致，其官方手册写明：「DNS 覆写仅针对直连类域名进行解析，代理类域名将经由代理服务器进行解析」。
 
-- 网段粒度用 /24——比这更细会被上游拒绝（明文 REFUSED）；
-- ECS 分支只用 Google（8.8.8.8 / 8.8.4.4，同一 anycast 服务）；干净分支只用 1.1.1.1——Cloudflare 按其隐私政策**永不转发 ECS**，这是「无 ECS」保证的来源，两支不可混用；
-- `#proxy&ecs=...&ecs-override=true` 的多参数语法在 mihomo 官方文档和 Shadowrocket 社区手册中同形记载（`&` 串联）；
-- 换成你所在地运营商的网段更优：联通北京 `202.106.0.0/24`（当前）、电信上海 `202.96.209.0/24`、电信广东 `202.96.128.0/24`、移动 `211.136.192.0/24`。
+早先的版本把全部 DNS 用 `#proxy` 压进代理，结果国内域名每次解析都要跨太平洋两趟，实测 `www.meituan.com` 要 2089ms、`ctrip.com` 772ms；改为本方案后分别是 145ms 和 76ms。
 
-### 代价与边界
+### 不要改成「全部域名一律用境外 DNS」
 
-- 所有未缓存域名的解析都经代理往返（实测首次 278–843ms，缓存后 16–17ms），影响集中在每个域名的首次访问；
-- 少数国内站点权威不认 ECS（`www.baidu.com`）或用全球 CDN（`ctrip.com`），仍解析到境外 IP，由 `ChinaDomain.list` 按域名兜住（位置在 `GEOIP,CN` 之前）；
-- 在中国部署了 CDN 的境外站点（如部分 Apple/Microsoft 域名）ECS 答案可能是国内 IP，会被判直连——这与主流规则集的处理方向一致，是期望行为。
+这个念头很容易冒出来：所有域名都交给境外 DNS 解析，再靠 `GEOIP,CN` 判断走直连还是走代理——逻辑最干净，不用维护任何国内域名列表，也绝无国内 DNS 泄露。
+
+**这个方案会让 bilibili 之类的站点彻底打不开**，而且故障非常隐蔽。实测：
+
+| 域名 | 境外 DNS（无 ECS）解析到 | 归属 |
+| --- | --- | --- |
+| `www.bilibili.com` | `192.254.90.178` | 美国洛杉矶 Zenlayer |
+| `api.bilibili.com` | `148.153.45.10` | 美国洛杉矶 |
+| `i0.hdslb.com` | `138.113.102.14` | 加拿大多伦多 |
+
+境外 DNS 把你导向了 bilibili 给**海外用户**准备的边缘节点。而 `bilibili.com` 命中 `DOMAIN-SUFFIX` 规则被判 `DIRECT`，于是变成**从国内直连一台美国服务器**：不走代理所以没有隧道加速，纯国际直连又慢又容易被掐，那些节点回的还是国际版内容。
+
+关键在于**规则层看起来完全正确**——日志里明明白白写着 `📺 B站[DIRECT]`，完全符合预期。问题全在解析结果上，只看路由日志永远查不出来，必须把解析到的 IP 拉出来验归属。
+
+同一份域名规则配上不同来源的 DNS，会得到完全不同的结果。本方案让直连域名走国内 DoH，拿到的必然是国内节点，从根上避免了这种「规则说直连、IP 在境外」的错配：
+
+| 域名 | 国内 DoH 解析到 | 归属 |
+| --- | --- | --- |
+| `www.bilibili.com` | `117.23.60.12` | 陕西 |
+| `api.bilibili.com` | `106.118.30.8` | 石家庄 |
+| `i0.hdslb.com` | `36.104.142.56` | 杭州 |
 
 ## 隐私边界
 
@@ -124,7 +115,7 @@ ECS 相关的工程细节：
 - DoH 会加密设备到 DNS 服务商之间的查询，局域网和运营商通常看不到明文域名；
 - DNS 服务商仍然能够看到它负责解析的域名；
 - 为了让未知域名经过 `GEOIP,CN` 判断，客户端必须先解析它；
-- 严格版配置中不含任何国内 DNS，国内 DNS 服务商看不到你的任何查询；代价是解析要经代理往返；
+- 严格版中，国内 DNS 只看得到被规则集判定为国内的域名，看不到你访问的境外站点；
 - 平衡版会把国内域名和未收录的未知域名都交给国内 DNS，这是它换取速度的代价；
 - 不同版本的 Shadowrocket 对 Clash DNS 字段的导入支持可能不同。导入后应确认 DNS 服务器是 `https://` 而不是 `system`。
 
@@ -137,28 +128,55 @@ ECS 相关的工程细节：
 3. <https://browserleaks.com/dns> 或 <https://dnsleaktest.com> 不出现中国联通、电信、移动或任何中国地区解析器；
 4. bilibili、ToDesk 等国内服务在日志中仍显示直连，且访问不慢。
 
-实测结果（mihomo v1.19.25 + subconverters.com 生成的真实订阅 + 真实节点）：
+实测结果（mihomo v1.19.25 + subconverters.com 生成的真实订阅）：
 
 | 项目 | 结果 |
 | --- | --- |
-| 泄露检测解析器 | 全部美国 Google/Cloudflare，零中国解析器 |
-| `frp-arm.com`（规则集未收录） | ECS 答案西安联通 → `GeoIP(cn)` → `DIRECT` |
-| `www.bilibili.com` | policy 钉 ECS → 太原联通，`DIRECT` |
-| `github.com` / `www.amazon.com` | policy 钉无 ECS → 美国 Quincy / 洛杉矶 |
-| `macked.app`（未知境外） | filter 换用干净答案 → 走代理 |
-| Cloudflare 边缘核验 | `colo=LAS`（美国），非亚太 |
-
-Shadowrocket 侧一项无法在本机验证：它对 Clash `fallback` / `fallback-filter` 字段的支持程度。导入后请在 DNS 设置里确认这两组服务器都存在、`#proxy` 与 `ecs=` 参数未丢失；若 filter 不生效，退化行为是未知境外域名偶尔拿到亚太节点（经代理仍可用），已知域名不受影响。
+| 泄露检测解析器 | 12/12 美国 Google，零中国解析器 |
+| 境外域名本地 DNS 记录 | 0 条 |
+| 国内域名本地 DNS 记录 | 12 条，全部走国内 DoH |
+| 国内域名解析耗时 | 76–145ms |
 
 ## 陌生国内域名怎么处理
 
-不需要处理。未被规则集收录的域名会先解析再按 IP 判定，解析出国内 IP 就直连。实测 `frp-arm.com` 即属此类。
+`GEOIP,CN` 带了 `no-resolve`，好处是境外域名完全不碰本地 DNS，代价是**没被规则集收录的国内域名不再靠 IP 兜底判直连**，会走代理。
 
-少数站点的权威服务器不认 ECS（`www.baidu.com`）或使用全球 CDN（`ctrip.com`、`qunar.com`），即使带 ECS 也会解析到境外 IP，`GEOIP,CN` 会判错。它们由 `ChinaDomain.list` 按域名兜住，该规则集位置在 `GEOIP,CN` 之前。若你遇到别的这类站点，加一条：
+因此严格版额外引入了 `ChinaMax.list`（12.4 万条），把这个缺口压到最小。实测 `frp-arm.com`（西安联通，不在 ACL4SSR 的 `ChinaDomain.list` 里）由此正确直连。
+
+代价是订阅体积：440KB / 9,713 条 → 5.6MB / 134,193 条。如果 Shadowrocket 导入变慢或不稳，删掉 `ChinaMax.list` 那一行即可退回小规则集，再按需逐条补：
 
 ```ini
-ruleset=🎯 国内,[]DOMAIN-SUFFIX,example.com
+ruleset=🎯 国内,[]DOMAIN-SUFFIX,example.cn
 ```
+
+### 为什么要把泄露检测站强制走代理
+
+`browserleaks.com` 被 `ChinaMax` 收录（该表的定义是"国内可直连"，不是"中国站点"）。若判直连，它的域名会由国内 DoH 解析，检测结果就会显示中国解析器——但那测的是直连链路，不是你要验证的代理链路。
+
+所以 `.ini` 里有三条排在国内规则集之前的覆盖规则，把 `browserleaks.com` / `dnsleaktest.com` / `ipleak.net` 强制归入代理组。删掉它们，检测结果会失真。
+
+## Clash Verge 专用增强版
+
+`https://raw.githubusercontent.com/muzenc/ACL4SSR-DNS-Balanced/main/ACL4SSR_DNS_Strict_Mihomo.ini`
+
+三层结构：`nameserver-policy` 把已知国内域名钉在「Google DoH + 中国 ECS」、已知境外域名钉在「1.1.1.1 无 ECS」，其余未知域名由 `nameserver`(ECS) 与 `fallback`(无 ECS) 并发查询、`fallback-filter` 按结果国别自动分拣。全部解析器在境外且经代理，未收录的国内域名（如 `frp-arm.com`）也能按 IP 判定直连，不依赖规则集覆盖。
+
+**为什么 Shadowrocket 不能用这套**——实测证据链：
+
+1. 这套设计要求本地解析未知域名（`GEOIP,CN` 需要 IP）；
+2. Shadowrocket 的本地 DNS 查询不走 `#proxy` 隧道：在只有美国节点的订阅下，泄露检测出现了 **Google 香港 / Cloudflare 新加坡**解析器——查询是从中国直连发出、被 anycast 就近接到亚洲接入点的（若经隧道，只可能是美国接入点）；
+3. 它也不支持 `nameserver-policy`（仅 mihomo 字段）。
+
+所以 Shadowrocket 上任何「本地解析未知域名」的方案都会把查询暴露在隧道之外。主严格版为此换了思路：未知域名根本不在本地解析（`no-resolve`），直接交给节点远端解析——这正是 Shadowrocket 的原生模型，也是它在实测中泄露检测干净的原因。
+
+两版的取舍：
+
+| | 严格版（主，SR+Verge 都可用） | Verge 增强版 |
+| --- | --- | --- |
+| 泄露检测 | 干净（远端解析，无本地查询可测） | 干净（本地查询全部经隧道，美国解析器） |
+| 国内域名解析 | 国内 DoH，最快最准 | Google+ECS 经代理，首次慢 |
+| 国内 DNS 商可见性 | 看得到你访问的国内域名 | 零 |
+| 未收录国内域名 | 走代理（可手动加规则） | 按 IP 判定，自动直连 |
 
 ## 上游规则
 

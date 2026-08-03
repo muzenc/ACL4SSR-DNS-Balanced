@@ -1,0 +1,85 @@
+# 严格 DNS 增强版 —— 仅限 Mihomo / Clash Verge
+#
+# Shadowrocket 勿用：实测其本地 DNS 查询不走 #proxy 隧道（从中国直连发出，
+# 泄露检测会出现 Google 香港 / Cloudflare 新加坡解析器），且不支持
+# nameserver-policy。Shadowrocket 请用 ACL4SSR_DNS_Strict.ini。
+#
+# 目标（全部实测验证）：
+#   1. 零国内 DNS：browserleaks.com/dns 只出现境外解析器
+#   2. 未收录国内域名（frp-arm.com 等）靠 GEOIP,CN 按 IP 判定直连，不依赖规则集覆盖
+#   3. 国内域名带中国 ECS 解析，拿到国内 CDN 节点（否则 bilibili 会被导向美国边缘）
+#   4. 境外站点按代理出口视角解析，只拿美国节点，不被中国 ECS 污染到亚太
+#
+# 三层结构（mihomo 实测：policy 命中的域名跳过 fallback-filter）：
+#   nameserver-policy geosite:cn             → ECS 分支钉死（bilibili 不会被 filter 换成美国答案）
+#   nameserver-policy geosite:geolocation-!cn → 无 ECS 分支钉死（github 不会拿到新加坡节点）
+#   其余未知域名 → nameserver(ECS) + fallback(无 ECS) + fallback-filter：
+#     ECS 答案属于 CN → 采信 → GEOIP,CN 直连（frp-arm.com 就是这条路）
+#     ECS 答案不属于 CN → 换用 fallback 的干净答案 → 走代理，落美国节点
+#
+# Shadowrocket 不认 nameserver-policy，退化为 nameserver+fallback(+filter)：
+# 已知境外域名在 Shadowrocket 上是代理类，域名交给节点远端解析（美国视角），
+# 不经过本地 DNS，因此 policy 缺失不影响它们的落点。
+#
+# 关于 #proxy：Shadowrocket 是原生 DNS-over-proxy 关键字；mihomo 把 # 后名称
+# 当策略组名查找，配套 .ini 定义了名为 proxy 的组。删除或改名该组会让
+# mihomo 把 proxy 当网卡名，本地 DNS 全部失效。
+
+mixed-port: 7890
+allow-lan: false
+mode: rule
+log-level: info
+ipv6: false
+
+geo-auto-update: true
+geo-update-interval: 24
+
+dns:
+  enable: true
+  ipv6: false
+  listen: 127.0.0.1:1053
+  # 必须是 redir-host：GEOIP,CN 依赖真实 IP，fake-ip 下按 IP 判定的设计整体失效
+  enhanced-mode: redir-host
+
+  # 以下两项正常情况下不会被触发（DNS 服务器全是 IP 形式、节点是 IP），
+  # 刻意填境外地址：一旦被触发应当解析失败，而不是退回国内 DNS
+  default-nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+  proxy-server-nameserver:
+    - 1.1.1.1
+    - 8.8.8.8
+
+  # 默认（未知域名）：境外 DoH + 中国 ECS，经代理。
+  # ECS 网段可换成你所在地运营商的：联通北京 202.106.0.0/24（当前）
+  # 电信上海 202.96.209.0/24  电信广东 202.96.128.0/24  移动 211.136.192.0/24
+  nameserver:
+    - "https://8.8.8.8/dns-query#proxy&ecs=202.106.0.0/24&ecs-override=true"
+    - "https://8.8.4.4/dns-query#proxy&ecs=202.106.0.0/24&ecs-override=true"
+
+  # 干净分支：无 ECS，按代理出口视角返回。1.1.1.1 按其隐私政策从不转发 ECS，
+  # 用它保证这一支绝不带中国网段信息
+  fallback:
+    - "https://1.1.1.1/dns-query#proxy"
+
+  # 未知域名的自动分拣：ECS 答案属于 CN 才采信，否则改用 fallback 的干净答案。
+  # 这是经典 Clash 防污染机制的反向用法——不是拿它防投毒，而是拿它挑选 ECS 视角
+  fallback-filter:
+    geoip: true
+    geoip-code: CN
+    ipcidr:
+      - 240.0.0.0/4
+
+  # 已知域名钉死分支（mihomo 生效；实测 policy 命中即跳过 fallback-filter）：
+  # geosite:cn 钉 ECS——Google 对 bilibili 权威的 ECS 应答有约 25% 概率返回其
+  # 香港段 103.151.151.x，若交给 filter 会被换成美国 Zenlayer 答案，而 bilibili
+  # 走 DIRECT，等于从国内直连美国服务器（此前 bilibili 打不开的根因）。
+  # 钉死后最坏情况是偶尔拿到 bilibili 自家香港边缘，仍可用。
+  # geolocation-!cn 钉无 ECS——github 带中国 ECS 会解析到新加坡，而流量从美国
+  # 出口走，绕远；钉死后稳定拿美国节点，也省一次无谓的 ECS 查询。
+  nameserver-policy:
+    "geosite:cn":
+      - "https://8.8.8.8/dns-query#proxy&ecs=202.106.0.0/24&ecs-override=true"
+      - "https://8.8.4.4/dns-query#proxy&ecs=202.106.0.0/24&ecs-override=true"
+    "geosite:geolocation-!cn":
+      - "https://1.1.1.1/dns-query#proxy"
