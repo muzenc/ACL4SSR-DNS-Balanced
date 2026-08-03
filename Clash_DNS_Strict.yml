@@ -56,6 +56,19 @@ dns:
     - "https://8.8.8.8/dns-query#proxy&ecs=202.106.0.0/24&ecs-override=true"
     - "https://8.8.4.4/dns-query#proxy&ecs=202.106.0.0/24&ecs-override=true"
 
+  # 已知的境外域名不带 ECS。带上中国 ECS 会让它们返回亚太边缘节点，而你是从
+  # 代理出口访问的，等于绕远：实测 github.com 带 ECS 解析到新加坡
+  # 20.205.243.166，不带则是旧金山 140.82.116.4。顺带也不必告诉境外站点你在中国。
+  #
+  # 未被 geosite 收录的域名仍走上面带 ECS 的默认解析器——这是有意的：
+  # 未知域名更可能是国内站点，带 ECS 才能拿到正确的国内 IP 供 GEOIP,CN 判定。
+  #
+  # 此字段仅 Mihomo 识别，Shadowrocket 会忽略（其行为退化为全部带 ECS，仍可用）。
+  nameserver-policy:
+    "geosite:geolocation-!cn":
+      - "https://1.1.1.1/dns-query#proxy"
+      - "https://8.8.8.8/dns-query#proxy"
+
 # 少数站点的权威服务器不认 ECS（www.baidu.com）或使用全球 CDN（ctrip.com、
 # qunar.com），仍会解析到境外 IP，GEOIP,CN 会判错。它们由 ChinaDomain.list
 # 按域名兜住，该规则集位置在 GEOIP,CN 之前。
